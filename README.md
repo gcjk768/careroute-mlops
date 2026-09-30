@@ -2,7 +2,7 @@
 
 **How a clinical triage model gets built, gated, released, watched and retrained, so that a model which fails a quality, safety or fairness bar cannot reach patients and nobody has to remember to check.**
 
-I built this as the ML/MLOps owner of [CareRoute AI](https://github.com/gcjk768/careroute-ai), a multi-agent triage system made by a 5-person team for the NUS-ISS MTech (*Architecting AI Systems* practice module). It applies the MLOps toolchain taught in the NUS-ISS *Integrating & Deploying AI Solutions* course (MLflow, DVC, Evidently) to a real service. This repo pulls out my part so it can be read on its own: the ML package, its tests, the CI jobs and the design write-up. The full system (agents, frontend, Terraform) is in the [main repo](https://github.com/gcjk768/careroute-ai).
+I built this as the ML/MLOps owner of [CareRoute AI](https://github.com/gcjk768/careroute-ai), a multi-agent triage system made by a 5-person team for the NUS-ISS MTech (*Architecting AI Systems* practice module). It applies the MLOps toolchain taught in the NUS-ISS *Deploying & Operating AI Solutions* course (MLflow, DVC, Evidently) to a real service. This repo pulls out my part so it can be read on its own: the ML package, its tests, the CI jobs and the design write-up. The full system (agents, frontend, Terraform) is in the [main repo](https://github.com/gcjk768/careroute-ai).
 
 ![CareRoute MLOps architecture](docs/architecture.png)
 
