@@ -1,0 +1,447 @@
+{
+  "family": "careroute-triage",
+  "n": 6000,
+  "seed": 42,
+  "rows": 6000,
+  "featureCount": 58,
+  "featureNames": [
+    "chest_pain",
+    "breathless",
+    "stroke_signs",
+    "severe_bleeding",
+    "anaphylaxis",
+    "suicidal",
+    "seizure",
+    "high_fever",
+    "persistent",
+    "vomiting",
+    "dehydrated",
+    "severe_pain",
+    "abdominal_pain",
+    "headache",
+    "dizziness",
+    "rash",
+    "sore_throat",
+    "cough",
+    "cold_symptoms",
+    "minor_wound",
+    "bruise",
+    "sprain_strain",
+    "unresponsive",
+    "choking",
+    "major_trauma",
+    "syncope",
+    "palpitations",
+    "wheeze_asthma",
+    "vision_loss",
+    "testicular_pain",
+    "pregnancy_concern",
+    "allergic_reaction",
+    "burn_injury",
+    "fracture",
+    "limb_swelling",
+    "foreign_body",
+    "urinary",
+    "diarrhoea",
+    "back_pain",
+    "eye_problem",
+    "ear_problem",
+    "dental",
+    "mental_distress",
+    "bite_sting",
+    "joint_pain",
+    "skin_infection",
+    "constipation",
+    "menstrual",
+    "muscle_ache",
+    "heartburn",
+    "fatigue",
+    "symptom_count",
+    "text_length",
+    "age_0_17",
+    "age_18_39",
+    "age_40_64",
+    "age_65p",
+    "sex_female"
+  ],
+  "statistics": {
+    "labelBalance": {
+      "0": 451,
+      "1": 823,
+      "2": 1804,
+      "3": 1809,
+      "4": 1113
+    },
+    "subgroupBalance": {
+      "0-17 \u00b7 Female": 881,
+      "0-17 \u00b7 Male": 933,
+      "18-39 \u00b7 Female": 877,
+      "18-39 \u00b7 Male": 894,
+      "40-64 \u00b7 Female": 869,
+      "40-64 \u00b7 Male": 830,
+      "65+ \u00b7 Female": 358,
+      "65+ \u00b7 Male": 358
+    },
+    "features": {
+      "chest_pain": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.011167,
+        "std": 0.105081
+      },
+      "breathless": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.008667,
+        "std": 0.092691
+      },
+      "stroke_signs": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.008667,
+        "std": 0.092691
+      },
+      "severe_bleeding": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.017167,
+        "std": 0.129892
+      },
+      "anaphylaxis": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.0095,
+        "std": 0.097004
+      },
+      "suicidal": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.008333,
+        "std": 0.090906
+      },
+      "seizure": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.009333,
+        "std": 0.096157
+      },
+      "high_fever": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.139,
+        "std": 0.345947
+      },
+      "persistent": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.071667,
+        "std": 0.257935
+      },
+      "vomiting": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.039167,
+        "std": 0.193991
+      },
+      "dehydrated": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.053667,
+        "std": 0.225359
+      },
+      "severe_pain": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.035833,
+        "std": 0.185874
+      },
+      "abdominal_pain": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.051833,
+        "std": 0.22169
+      },
+      "headache": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.0185,
+        "std": 0.134751
+      },
+      "dizziness": {
+        "min": 0.0,
+        "max": 0.0,
+        "mean": 0.0,
+        "std": 0.0
+      },
+      "rash": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.029667,
+        "std": 0.169666
+      },
+      "sore_throat": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.083167,
+        "std": 0.276134
+      },
+      "cough": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.0675,
+        "std": 0.250886
+      },
+      "cold_symptoms": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.057167,
+        "std": 0.232161
+      },
+      "minor_wound": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.0345,
+        "std": 0.18251
+      },
+      "bruise": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.051667,
+        "std": 0.221353
+      },
+      "sprain_strain": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.035833,
+        "std": 0.185874
+      },
+      "unresponsive": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.009333,
+        "std": 0.096157
+      },
+      "choking": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.009333,
+        "std": 0.096157
+      },
+      "major_trauma": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.0165,
+        "std": 0.127388
+      },
+      "syncope": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.007167,
+        "std": 0.084352
+      },
+      "palpitations": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.0085,
+        "std": 0.091803
+      },
+      "wheeze_asthma": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.010833,
+        "std": 0.103518
+      },
+      "vision_loss": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.007833,
+        "std": 0.088159
+      },
+      "testicular_pain": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.009167,
+        "std": 0.095303
+      },
+      "pregnancy_concern": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.0155,
+        "std": 0.12353
+      },
+      "allergic_reaction": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.016167,
+        "std": 0.126116
+      },
+      "burn_injury": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.007833,
+        "std": 0.088159
+      },
+      "fracture": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.007833,
+        "std": 0.088159
+      },
+      "limb_swelling": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.008667,
+        "std": 0.092691
+      },
+      "foreign_body": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.024,
+        "std": 0.153049
+      },
+      "urinary": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.034667,
+        "std": 0.182934
+      },
+      "diarrhoea": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.034167,
+        "std": 0.181657
+      },
+      "back_pain": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.036,
+        "std": 0.18629
+      },
+      "eye_problem": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.017333,
+        "std": 0.13051
+      },
+      "ear_problem": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.037333,
+        "std": 0.189577
+      },
+      "dental": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.019667,
+        "std": 0.138852
+      },
+      "mental_distress": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.018833,
+        "std": 0.135936
+      },
+      "bite_sting": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.019833,
+        "std": 0.139427
+      },
+      "joint_pain": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.018333,
+        "std": 0.134154
+      },
+      "skin_infection": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.024,
+        "std": 0.153049
+      },
+      "constipation": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.019667,
+        "std": 0.138852
+      },
+      "menstrual": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.019833,
+        "std": 0.139427
+      },
+      "muscle_ache": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.059167,
+        "std": 0.235936
+      },
+      "heartburn": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.022167,
+        "std": 0.147225
+      },
+      "fatigue": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.03,
+        "std": 0.170587
+      },
+      "symptom_count": {
+        "min": 0.0,
+        "max": 0.666667,
+        "mean": 0.235278,
+        "std": 0.118618
+      },
+      "text_length": {
+        "min": 0.01,
+        "max": 0.17,
+        "mean": 0.046937,
+        "std": 0.024459
+      },
+      "age_0_17": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.302333,
+        "std": 0.459269
+      },
+      "age_18_39": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.295167,
+        "std": 0.456118
+      },
+      "age_40_64": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.283167,
+        "std": 0.450537
+      },
+      "age_65p": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.119333,
+        "std": 0.32418
+      },
+      "sex_female": {
+        "min": 0.0,
+        "max": 1.0,
+        "mean": 0.4975,
+        "std": 0.499994
+      }
+    }
+  },
+  "split": {
+    "testSize": 0.25,
+    "randomState": 42,
+    "stratified": true
+  },
+  "provenance": {
+    "generator": "app.ml.data.generate_dataset",
+    "seed": 42,
+    "synthetic": true
+  },
+  "dataSha256": "f623aa41afef5f71b447dee53a69bc22b849e0f1de5611b9aae78b441e5f951f"
+}

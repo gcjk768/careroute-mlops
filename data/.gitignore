@@ -1,0 +1,6 @@
+# [MLOps][DVC] Pillar 2 — data versioning.
+# The materialized dataset snapshot is versioned by DVC (tracked via the small
+# triage_dataset.npz.dvc pointer that IS committed to git), NOT by git directly —
+# large binaries don't belong in git. The lineage metadata record
+# (triage_dataset.meta.json) IS committed as the human-readable data-version anchor.
+/triage_dataset.npz
