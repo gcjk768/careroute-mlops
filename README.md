@@ -94,7 +94,7 @@ python -m app.ml.train                     # train, gate, persist (and register 
 python -m app.ml.monitor                   # drift + performance report
 ```
 
-No API keys or cloud account are needed. The dataset is synthetic and seeded, so every run is reproducible.
+No API keys or cloud account are needed. The dataset is synthetic and seeded, so every run is reproducible. The suite has 123 tests. They all pass, and a full run takes about 35 minutes on a laptop because several tests retrain the model to check the gates.
 
 ## Repo layout
 
