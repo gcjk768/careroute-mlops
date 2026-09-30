@@ -1,0 +1,13 @@
+# [MLOps] Heavier / optional MLOps tooling, kept SEPARATE from requirements-dev.txt
+# so the core test install can never be broken by them (they pull large transitive
+# deps like pandas/pyarrow). Install only when working on the data-versioning or
+# monitoring pipeline:
+#     pip install -r requirements.txt -r requirements-mlops.txt
+#
+# These are the exact tools the "Integrating & Deploying AI Solutions" module names
+# in its MLOps tool table (Experiment Tracking / Model Registry = MLflow;
+# Monitoring / Drift = Evidently AI; Data versioning = DVC).
+mlflow==3.16.1        # experiment tracking + model registry (Pillar 1)
+evidently==0.4.33     # data-drift + model-performance monitoring reports (Pillar 3)
+dvc[s3]==3.67.1       # dataset version control / data lineage (Pillar 2); [s3] = the artifacts-bucket remote
+reportlab==5.0.0      # executive PDF pipeline report (app.ml.report)
