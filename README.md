@@ -63,6 +63,8 @@ All three kinds of drift can trigger a retrain: data (the inputs shift), target 
 
 The training data under-represents patients aged 65+ on purpose, as happens in real clinical data, so the fairness mitigation has something real to fix. The weakest subgroup is still 65+ female at 0.79.
 
+The full [model card](MODEL_CARD.md) and [datasheet](DATASHEET.md) are tested too: `tests/test_model_card.py` and `tests/test_datasheet.py` check every number in them against a fresh training run, so a retrain that moves a metric fails CI instead of leaving the documents quietly out of date.
+
 ## Two bugs I found in my own pipeline
 
 **Drift detection could never fire.** PSI came out as exactly 0.0 for 27 of the 29 features. They are binary, so the quantile bin edges collapsed into a single bin, and the gate averaged across all features. Binary features are now binned properly, and the gate reads the *worst* per-feature PSI instead of the average.
@@ -77,7 +79,7 @@ The training data under-represents patients aged 65+ on purpose, as happens in r
 | Data versioning + lineage (DVC + hash gate) | **Runs**; lineage is a blocking gate |
 | Monitoring (Evidently/PSI, inference log, Prometheus) | **Runs** |
 | Continuous training (weekly + drift trigger) | **Configured**; needs a pipeline trigger token to fire |
-| Deployment lifecycle (shadow, promotion, canary, rollback) | **Configured**; defined and unit-tested, not yet run against a live environment |
+| Deployment lifecycle (shadow, promotion, canary, rollback) | **Configured**; the jobs are defined and the canary logic is unit-tested, but none has run against a live environment yet |
 
 Rows 4 and 5 are written and wired up, but haven't been proven in production. It's more useful to say so than to show five green ticks.
 
@@ -102,6 +104,8 @@ app/ml/        the ML package: data, features, model, training + release gate, r
 app/redact.py  PII redaction used by the inference log
 tests/         model gate, fairness, data provenance, canary, entrypoints, adversarial robustness
 ci/            the MLOps jobs from the full GitLab pipeline (for reading)
+MODEL_CARD.md  model card (Google Model Cards pattern + Singapore PDPC Model AI Governance Framework)
+DATASHEET.md   datasheet for the training data
 docs/          architecture (draw.io), pipeline stages, drift → retrain loop
 ```
 
