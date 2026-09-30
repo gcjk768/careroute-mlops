@@ -1,0 +1,1071 @@
+# CareRoute AI: the MLOps jobs, extracted from the full 10-stage GitLab pipeline.
+# Source: https://github.com/gcjk768/careroute-ai/blob/main/app/.gitlab-ci.yml
+# This file is for reading. The jobs reference templates, variables and images defined
+# in the full pipeline, so it is not meant to run on its own.
+
+stages:
+  - lint            # static style/type checks
+  - train           # [MLOps] BUILD + release-gate the severity model artifact (+ version the dataset)
+  - test            # unit + end-to-end behaviour tests (+ hard model-quality gate + data-lineage gate)
+  - monitor         # [MLOps] Pillar 3 — Evidently data-drift + model-performance report
+  - ai-security     # LLM red-team scanning (Promptfoo / Garak / DeepTeam / PyRIT) + guardrail regression
+  - security-scan   # SAST, SCA, secret, container, IaC & SBOM/AI-BOM scanning
+  - report          # [MLOps] executive PDF report — runs AFTER security-scan so it can
+                    # summarize the scanners' actual findings (gitleaks/semgrep/bandit/trivy)
+  - build           # container images
+  - deploy          # infrastructure + shadow/canary deploy (manual gate)
+  - post-deploy     # DAST against the DEPLOYED/staging app (needs a live target)
+
+
+# ── TRAIN ────────────────────────────────────────────────────────────────────
+# [MLOps] The train/serve SPLIT: this job is the ONE place a model artifact is
+# built. `python -m app.ml.train` builds the model end-to-end, enforces the
+# release gate (accuracy >= 0.75 AND red-flag recall >= 0.95 — the SAME floors
+# as test:model-gate, so a model that would fail CI is never persisted or
+# registered in the first place) — exiting NON-ZERO
+# and failing the pipeline on a gate breach — persists a versioned, content-
+# addressed joblib + a sidecar SHA-256 (tamper-evidence), and MLflow-registers
+# `CareRouteTriageRF` when MLflow is present. Downstream test/build jobs consume
+# the joblib via `needs:` so the container ships a VALIDATED artifact that
+# get_model() loads at boot instead of retraining on every process start.
+# [MLOps] Pillar 1 (experiment tracking + Model Registry) & Pillar 4 (Continuous
+# Training). `python -m app.ml.train` logs params/metrics and REGISTERS the model
+# as `CareRouteTriageRF` to whatever MLFLOW_TRACKING_URI points at. To send runs to
+# GitLab's built-in, MLflow-compatible Model Registry, set these two CI/CD variables
+# (Settings -> CI/CD -> Variables), no code change needed:
+#     MLFLOW_TRACKING_URI    = ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/ml/mlflow
+#     MLFLOW_TRACKING_TOKEN  = <a project/personal access token with api scope>
+# Unset -> mlflow logs to a local ./mlruns store (browse with `mlflow ui`).
+#
+# CONTINUOUS TRAINING: the `rules:` below also fire this job on a *scheduled*
+# pipeline (Settings -> CI/CD -> Pipeline schedules -> e.g. weekly), so the model
+# is periodically retrained + re-gated + re-registered on the latest code/data —
+# the scheduled-retraining trigger the course names.
+train:model:
+  stage: train
+  image: python:3.12-slim
+  variables:
+    CAREROUTE_MODEL_DIR: "$CI_PROJECT_DIR/backend/models"
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]train[:.]model(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'          # [CT] scheduled retrain
+    - if: '$CI_COMMIT_BRANCH'                           # every push
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - cd backend
+    - pip install -r requirements.txt -r requirements-dev.txt mlflow==3.16.1
+    - python -m app.ml.train                       # builds + release-gates + persists + MLflow-registers
+    # Emit the model audit (accuracy / red-flag recall / fairness / drift /
+    # calibration / integrity hashes) as a machine-readable release record.
+    - >
+      python -c "import json; from app.ml.model import get_model;
+      open('models/model_audit.json','w').write(json.dumps(get_model().fairness(), indent=2))"
+  artifacts:
+    name: "careroute-model-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - backend/models/*.joblib
+      - backend/models/*.sha256
+      - backend/models/model_audit.json
+      # The run's MLflow tracking store. The deployed MLflow server has no auth
+      # and stays internal-only, so CI cannot log to it; without these paths every
+      # run, metric and registered version vanished with the job. Download and
+      # `mlflow ui --backend-store-uri sqlite:///mlflow.db` to browse this run.
+      - backend/mlflow.db
+      - backend/mlruns/
+    expire_in: 30 days
+    when: on_success
+
+# [MLOps] Pillar 2 — DATA VERSIONING. Materialize the deterministic training
+# dataset to a snapshot + a content-addressed metadata record (dataSha256). In a
+# real setup `dvc add backend/data/triage_dataset.npz` versions the binary and the
+# committed .dvc pointer ties a commit to an exact dataset. Here the CI job proves
+# reproducibility and hands the metadata to the data-lineage gate below.
+#
+# --check RUNS FIRST, AND THAT ORDER IS THE WHOLE GATE. This job used to go
+# straight to write mode, which OVERWRITES backend/data/triage_dataset.meta.json
+# with whatever the current code produces. Every downstream check then compared
+# that freshly regenerated file against a model trained from the same code in the
+# same pipeline — the dataset was being compared to itself, and a change to
+# data.py or features.py that silently altered the training data would sail
+# through as "lineage verified". `--check` (export_dataset.check_snapshot) is the
+# real assertion: re-derive the dataset and diff its dataSha256 against the
+# COMMITTED meta.json, exiting 1 on a mismatch. Only then re-export.
+# DVC REMOTES. Two are configured in .dvc/config:
+#   * `s3` (DEFAULT since 2026-09-22): s3://careroute-demo-artifacts-<acct>/dvc,
+#     the artifacts bucket the infra repo provisions (enable_artifacts_bucket).
+#     On `main` this job assumes the same OIDC role deploy:push-images uses
+#     (AWS_DEPLOY_ROLE_ARN; its trust policy admits main only) and DVC's boto
+#     credential chain picks the web-identity token up from the environment.
+#     The role may touch the dvc/ prefix and nothing else in the bucket.
+#   * `gitlab`: the generic package registry of THIS project (added 2026-09-15).
+#     Used on every other branch, where the AWS role cannot be assumed, via the
+#     job token in a --local override that never touches the committed config.
+#     Locally a developer uses a personal access token in .dvc/config.local, or
+#     their own AWS credentials for the S3 remote.
+# `dvc pull` restores the committed snapshot BEFORE the reproducibility check so
+# the check compares the regenerated data against the file the pointer actually
+# names, and `dvc push` publishes a changed snapshot so the next clone can pull it.
+
+# [MLOps] Pillar 2 — DATA VERSIONING. Materialize the deterministic training
+# dataset to a snapshot + a content-addressed metadata record (dataSha256). In a
+# real setup `dvc add backend/data/triage_dataset.npz` versions the binary and the
+# committed .dvc pointer ties a commit to an exact dataset. Here the CI job proves
+# reproducibility and hands the metadata to the data-lineage gate below.
+#
+# --check RUNS FIRST, AND THAT ORDER IS THE WHOLE GATE. This job used to go
+# straight to write mode, which OVERWRITES backend/data/triage_dataset.meta.json
+# with whatever the current code produces. Every downstream check then compared
+# that freshly regenerated file against a model trained from the same code in the
+# same pipeline — the dataset was being compared to itself, and a change to
+# data.py or features.py that silently altered the training data would sail
+# through as "lineage verified". `--check` (export_dataset.check_snapshot) is the
+# real assertion: re-derive the dataset and diff its dataSha256 against the
+# COMMITTED meta.json, exiting 1 on a mismatch. Only then re-export.
+# DVC REMOTES. Two are configured in .dvc/config:
+#   * `s3` (DEFAULT since 2026-09-22): s3://careroute-demo-artifacts-<acct>/dvc,
+#     the artifacts bucket the infra repo provisions (enable_artifacts_bucket).
+#     On `main` this job assumes the same OIDC role deploy:push-images uses
+#     (AWS_DEPLOY_ROLE_ARN; its trust policy admits main only) and DVC's boto
+#     credential chain picks the web-identity token up from the environment.
+#     The role may touch the dvc/ prefix and nothing else in the bucket.
+#   * `gitlab`: the generic package registry of THIS project (added 2026-09-15).
+#     Used on every other branch, where the AWS role cannot be assumed, via the
+#     job token in a --local override that never touches the committed config.
+#     Locally a developer uses a personal access token in .dvc/config.local, or
+#     their own AWS credentials for the S3 remote.
+# `dvc pull` restores the committed snapshot BEFORE the reproducibility check so
+# the check compares the regenerated data against the file the pointer actually
+# names, and `dvc push` publishes a changed snapshot so the next clone can pull it.
+data:version:
+  stage: train
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]data[:.]version(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - when: on_success
+  image: python:3.12-slim
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: https://gitlab.com
+  variables:
+    CAREROUTE_DATA_DIR: "$CI_PROJECT_DIR/backend/data"
+  script:
+    - pip install -q "dvc[s3]==3.67.1"     # same pin as backend/requirements-mlops.txt
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ] && [ -n "${AWS_DEPLOY_ROLE_ARN:-}" ]; then
+        printf '%s' "$AWS_ID_TOKEN" > /tmp/aws-web-identity-token
+        export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/aws-web-identity-token
+        export AWS_ROLE_ARN="$AWS_DEPLOY_ROLE_ARN" AWS_ROLE_SESSION_NAME="gitlab-dvc-${CI_JOB_ID}"
+        export DVC_REMOTE=s3
+        echo "DVC remote: s3 (OIDC role on main)"
+      else
+        dvc remote modify --local gitlab custom_auth_header JOB-TOKEN
+        dvc remote modify --local gitlab password "$CI_JOB_TOKEN"
+        export DVC_REMOTE=gitlab
+        echo "DVC remote: gitlab package registry (branch ${CI_COMMIT_BRANCH:-?} cannot assume the AWS role)"
+      fi
+    # Keep the COMMITTED pointer: `dvc commit -f` below rewrites it in the workspace.
+    - cp backend/data/triage_dataset.npz.dvc /tmp/triage_dataset.npz.dvc.committed
+    # Best-effort: a snapshot missing from the remote is repaired by the push below,
+    # and a STALE pointer (the real failure mode) is caught by the pointer check.
+    - 'dvc pull -r "$DVC_REMOTE" -v || echo "dvc pull: snapshot named by the committed pointer is not in the remote (repaired by the push below if the pointer is current)"'
+    - cd backend
+    - pip install -r requirements.txt
+    # Keep a copy of the COMMITTED pointer BEFORE the export overwrites it, and
+    # pass it downstream as its own artifact. (Deliberately a plain `cp` rather
+    # than `git show HEAD:...`: with the docker executor the clone is performed
+    # by the runner HELPER image, so git is not guaranteed to exist inside
+    # python:3.12-slim. The checkout is pristine, so this file IS the commit.)
+    - cp data/triage_dataset.meta.json data/triage_dataset.meta.committed.json
+    # Fails the pipeline if the code no longer reproduces the COMMITTED snapshot.
+    - python -m app.ml.export_dataset --check
+    - python -m app.ml.export_dataset             # writes triage_dataset.{npz,meta.json}
+    # Publish the snapshot to the remote (no-op when unchanged). The export
+    # writes the .npz into the workspace only; `dvc push` uploads from DVC's
+    # CACHE, so without this commit it reported "Everything is up to date" and
+    # uploaded nothing. NOTE --check proves the CONTENT (dataSha256) is unchanged,
+    # not the .npz file's md5: the md5 of a compressed .npz also depends on the
+    # platform's zlib. The pointer committed in 5cb20cb was taken off-CI, named a
+    # snapshot this job never produces, and so every `dvc pull` failed on it.
+    - cd "$CI_PROJECT_DIR" && dvc commit -f backend/data/triage_dataset.npz.dvc
+    - dvc push -r "$DVC_REMOTE" -v
+    # POINTER GATE (after the push, so the object exists either way). The committed
+    # .dvc pointer must name exactly the file this job just versioned; otherwise a
+    # clone cannot `dvc pull` the dataset its model was trained on. The md5 is only
+    # stable inside this image (python:3.12-slim + numpy pin), so a pointer must be
+    # taken from this job, not from a developer machine.
+    - |
+      python - <<'PY'
+      import sys
+      committed = open("/tmp/triage_dataset.npz.dvc.committed").read()
+      current = open("backend/data/triage_dataset.npz.dvc").read()
+      if committed != current:
+          print("DVC pointer gate: FAILED - backend/data/triage_dataset.npz.dvc is stale.")
+          print("The snapshot is pushed; commit this pointer to make it pullable:\n")
+          print(current)
+          sys.exit(1)
+      print("DVC pointer gate: PASSED - committed pointer names the versioned snapshot")
+      PY
+  artifacts:
+    paths:
+      - backend/data/triage_dataset.meta.json
+      - backend/data/triage_dataset.meta.committed.json
+      - backend/data/triage_dataset.npz
+    expire_in: 1 week
+
+# [MLOps] Pillar 2 — DURABLE ARTIFACT STORE. CI job artifacts are ephemeral
+# (expire_in), so push the released model + its audit to GitLab's Package Registry
+# (free, permanent, versioned by the content-addressed model version) for audit &
+# rollback. Complements the MLflow registry copy from train:model. Runs on main.
+
+# [MLOps] Pillar 2 — DURABLE ARTIFACT STORE. CI job artifacts are ephemeral
+# (expire_in), so push the released model + its audit to GitLab's Package Registry
+# (free, permanent, versioned by the content-addressed model version) for audit &
+# rollback. Complements the MLflow registry copy from train:model. Runs on main.
+publish:model:
+  stage: train
+  image: curlimages/curl:latest
+  needs: ["train:model"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]publish[:.]model(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    # Package path is keyed on the commit SHA; the joblib FILENAME already carries
+    # the content-addressed model version (careroute-triage-rf-<versionId>.joblib),
+    # so both the release commit and the model identity remain traceable.
+    - |
+      BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/careroute-model/${CI_COMMIT_SHORT_SHA}"
+      for f in backend/models/*.joblib backend/models/*.sha256 backend/models/model_audit.json; do
+        echo "publishing $f -> $BASE/$(basename "$f")"
+        curl --fail --silent --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$f" "$BASE/$(basename "$f")" || echo "upload skipped for $f"
+      done
+  allow_failure: true
+
+# ── TEST ─────────────────────────────────────────────────────────────────────
+# Unit tests + COVERAGE: the regex surfaces total coverage in the MR widget /
+# job page; --cov-fail-under makes a coverage regression fail the job. The floor
+# is 80% — the widely-used industry baseline — now that the ML entrypoints
+# (train/monitor/report/validate_data/export_dataset) have dedicated tests
+# (test_ml_entrypoints.py, test_report.py, test_fairness.py). Measured ~81%.
+#
+# The two ML-attack modules are EXCLUDED here and run in their own job
+# (ai-security:ml-attacks, against the train:model artifact). They retrain the
+# full model six times (label-flip poisoning at three doses, a clean control, a
+# membership-inference victim) - that is the point of them, but one training
+# run costs ~5 min on a shared runner since the 22 -> 51 category widening, and
+# with them inside this job it ran past the 1 h job timeout (#2870327745,
+# 22 Sep: still running at 46 min while build:images sat blocked behind it),
+# where before the widening it took 23 min. Every other test still runs here.
+
+# [MLOps] DATA-VALIDATION GATE — "validate data BEFORE training on it". Blocking:
+# asserts the versioned snapshot's schema (feature space), value domain (no
+# NaN/inf, binary encoding), label validity + class support/balance, and
+# internal hash consistency. A malformed or degenerate dataset can never
+# silently become a released model.
+#
+# This job DOES check the regenerated snapshot rather than the committed one,
+# and that is correct here: the schema/domain/balance assertions need the actual
+# arrays, which live in the .npz (git-ignored, DVC-tracked, and not restorable
+# in CI without a DVC remote). data:version's `--check` step is what makes that
+# safe — the regenerated snapshot is proven byte-identical to the committed
+# meta.json's dataSha256 before this job ever sees it.
+data:validate:
+  stage: test
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]data[:.]validate(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - when: on_success
+  image: python:3.12-slim
+  needs: ["data:version"]
+  variables:
+    CAREROUTE_DATA_DIR: "$CI_PROJECT_DIR/backend/data"
+  script:
+    - cd backend
+    - pip install -r requirements.txt
+    - python -m app.ml.validate_data
+
+# [MLOps][Responsible-AI] Offline triage-EVAL benchmark on a gold vignette set:
+# acuity accuracy floor, red-flag recall == 1.0 on must-escalate cases, and
+# citation-groundedness. Drives the deterministic (no-LLM) pipeline, so it is a
+# reproducible release gate on end-to-end triage quality.
+
+# [MLOps] HARD MODEL-QUALITY GATE. Unlike the LLM red-team jobs below (which are
+# allow_failure), this job MUST pass: it is NOT allow_failure, runs in the `test`
+# stage (which precedes build/deploy), and consumes the artifact from train:model
+# via `needs:`, so a model that regresses below the release thresholds
+# (accuracy >= 0.75 AND safety-critical red-flag recall >= 0.95) BLOCKS the whole
+# build/deploy pipeline. This is the release gate on the DEPLOYED artifact.
+#
+# THE ARTIFACT IS THE POINT. `needs: ["train:model"]` + CAREROUTE_MODEL_DIR are
+# what put a persisted joblib where get_model() will find it, and the test file
+# now ASSERTS it loaded one (TriageModel.loaded_from_artifact). Without that
+# assertion the gate was self-fulfilling: TriageModel.__init__ silently trains a
+# fresh model when nothing loads, so "the release gate on the deployed artifact"
+# would pass green having graded a model it built itself, seconds earlier, from
+# the same code — proving nothing about what the pipeline was about to ship.
+# Do NOT set CAREROUTE_ALLOW_FRESH_MODEL_IN_GATE here: in CI a missing artifact
+# means this `needs:` did not deliver, which is a failure, not a skip.
+test:model-gate:
+  stage: test
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]test[:.]model\-gate(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - when: on_success
+  image: python:3.12-slim
+  needs: ["train:model"]
+  variables:
+    CAREROUTE_MODEL_DIR: "$CI_PROJECT_DIR/backend/models"
+  script:
+    - cd backend
+    - pip install -r requirements.txt -r requirements-dev.txt
+    # [MLOps] TRAIN/SERVE SKEW, checked against the artifact this pipeline just
+    # built and is about to ship — not against whatever a developer has on disk.
+    # Blocking, and deliberately BEFORE the quality gate: grading the accuracy of
+    # a model that is being fed features it was never trained on measures nothing.
+    # See backend/app/ml/feature_contract.py.
+    - |
+      python -m app.ml.feature_contract --check
+    - pytest tests/test_model_gate.py tests/test_feature_contract.py -q --junitxml=model-gate-report.xml
+  artifacts:
+    reports:
+      junit: backend/model-gate-report.xml
+    when: always
+  # NOT allow_failure — this gate blocks build & deploy on a quality regression.
+
+# [MLOps] Pillar 2 — DATA-LINEAGE GATE. Asserts the COMMITTED dataset's content
+# hash (dataSha256) EQUALS the hash the trained model recorded in
+# model_audit.json. This proves the released model was trained on exactly the
+# versioned data — catching silent data/feature drift between the dataset and the
+# model. Consumes both upstream artifacts via `needs:`. A real gate (not
+# allow_failure): a lineage mismatch blocks build/deploy.
+#
+# THE REFERENCE IS THE COMMITTED POINTER, NOT THE REGENERATED FILE. data:version
+# rewrites backend/data/triage_dataset.meta.json in this same pipeline and
+# passes it here as an artifact, so reading that file compared the regenerated
+# dataset against a model trained from the same code moments earlier — a
+# tautology that passes by construction. `triage_dataset.meta.committed.json` is
+# data:version's pre-export copy: the only version that predates this pipeline
+# and can therefore disagree with it. (data:version's `--check` step catches the
+# same class of problem earlier; this is the second half of that guarantee, on
+# the model side.)
+
+# [MLOps] Pillar 2 — DATA-LINEAGE GATE. Asserts the COMMITTED dataset's content
+# hash (dataSha256) EQUALS the hash the trained model recorded in
+# model_audit.json. This proves the released model was trained on exactly the
+# versioned data — catching silent data/feature drift between the dataset and the
+# model. Consumes both upstream artifacts via `needs:`. A real gate (not
+# allow_failure): a lineage mismatch blocks build/deploy.
+#
+# THE REFERENCE IS THE COMMITTED POINTER, NOT THE REGENERATED FILE. data:version
+# rewrites backend/data/triage_dataset.meta.json in this same pipeline and
+# passes it here as an artifact, so reading that file compared the regenerated
+# dataset against a model trained from the same code moments earlier — a
+# tautology that passes by construction. `triage_dataset.meta.committed.json` is
+# data:version's pre-export copy: the only version that predates this pipeline
+# and can therefore disagree with it. (data:version's `--check` step catches the
+# same class of problem earlier; this is the second half of that guarantee, on
+# the model side.)
+test:data-lineage:
+  stage: test
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]test[:.]data\-lineage(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - when: on_success
+  image: python:3.12-slim
+  needs: ["train:model", "data:version"]
+  variables:
+    CAREROUTE_DATA_DIR: "$CI_PROJECT_DIR/backend/data"
+  script:
+    - cd backend
+    - pip install -r requirements.txt
+    - |
+      python - <<'PY'
+      import json
+      committed = json.load(open("data/triage_dataset.meta.committed.json"))["dataSha256"]
+      regenerated = json.load(open("data/triage_dataset.meta.json"))["dataSha256"]
+      md = json.load(open("models/model_audit.json"))["integrity"]["dataSha256"]
+      print("committed   dataSha256 :", committed[:24])
+      print("regenerated dataSha256 :", regenerated[:24])
+      print("model       dataSha256 :", md[:24])
+      assert committed == regenerated, (
+          "DATASET DRIFT: the code no longer reproduces the COMMITTED snapshot. "
+          "Re-run `python -m app.ml.export_dataset` and commit the new meta.json "
+          "(and `dvc add` the .npz) as a deliberate, reviewed dataset version."
+      )
+      assert committed == md, (
+          "DATA-LINEAGE MISMATCH: committed dataset != model's training data"
+      )
+      print("data-lineage gate  : PASSED — model trained on the COMMITTED dataset")
+      PY
+
+# [MLOps] DATA-VALIDATION GATE — "validate data BEFORE training on it". Blocking:
+# asserts the versioned snapshot's schema (feature space), value domain (no
+# NaN/inf, binary encoding), label validity + class support/balance, and
+# internal hash consistency. A malformed or degenerate dataset can never
+# silently become a released model.
+#
+# This job DOES check the regenerated snapshot rather than the committed one,
+# and that is correct here: the schema/domain/balance assertions need the actual
+# arrays, which live in the .npz (git-ignored, DVC-tracked, and not restorable
+# in CI without a DVC remote). data:version's `--check` step is what makes that
+# safe — the regenerated snapshot is proven byte-identical to the committed
+# meta.json's dataSha256 before this job ever sees it.
+
+# ── MONITOR ──────────────────────────────────────────────────────────────────
+# [MLOps] Pillar 3 — MODEL & DATA MONITORING (course: "Monitoring and Logging").
+# Generates an Evidently AI report (the drift tool named in the course tool table)
+# comparing a REFERENCE distribution vs a shifted "production" sample: data drift
+# (PSI/KS), target drift, and classification performance (accuracy/precision/
+# recall/F1). Degrades to a built-in PSI+accuracy report if Evidently is absent,
+# so the job always publishes something. Reporting job (allow_failure) — the
+# shifted sample is EXPECTED to drift. Publishes the HTML dashboard + JSON.
+#
+# [MLOps][CT] The loop is CLOSED: monitor.py compares the headline drift value
+# to CAREROUTE_DRIFT_THRESHOLD and, on a breach, calls the GitLab trigger API
+# to fire a retrain pipeline (train:model re-trains, re-gates, re-registers).
+# To activate, set ONE CI/CD variable (Settings -> CI/CD -> Variables):
+#     CAREROUTE_PIPELINE_TRIGGER_TOKEN = <a Pipeline trigger token>
+# A triggered pipeline never re-triggers itself (CI_PIPELINE_SOURCE guard), so
+# one breach yields exactly one retrain. Optional knobs:
+#     CAREROUTE_DRIFT_THRESHOLD  (default 0.5 driftShare / 0.25 PSI)
+#     CAREROUTE_MONITOR_SOURCE=live  — monitor REAL logged traffic instead of
+#     the synthetic shift (needs an inference log mounted into the job).
+monitor:evidently:
+  stage: monitor
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]monitor[:.]evidently(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - when: on_success
+  image: python:3.12-slim
+  needs: ["train:model"]
+  variables:
+    CAREROUTE_MODEL_DIR: "$CI_PROJECT_DIR/backend/models"
+    CAREROUTE_MONITOR_DIR: "$CI_PROJECT_DIR/backend/monitoring"
+  script:
+    - |
+      cd backend
+      pip install -r requirements.txt
+      pip install -r requirements-mlops.txt || echo "mlops extras unavailable — monitor.py will use its built-in PSI fallback"
+      python -m app.ml.monitor
+  artifacts:
+    paths:
+      - backend/monitoring/drift_report.html
+      - backend/monitoring/drift_report.json
+    when: always
+    expire_in: 1 week
+  allow_failure: true
+
+# ── REPORT ───────────────────────────────────────────────────────────────────
+# [MLOps] Executive PDF report — a management-facing summary (model quality,
+# release gates, fairness, calibration, data lineage, drift, pipeline/supply
+# chain, and the ACTUAL security-scan findings) rendered to PDF with reportlab.
+# Runs after security-scan and `needs:` the scanners' JSON/SARIF artifacts so
+# the "Security scan results" section shows real counts; the scan needs are
+# `optional` so a pipeline where a scanner didn't run still gets a report.
+# This is the "hand to stakeholders" artifact; download it from the job.
+
+# ── REPORT ───────────────────────────────────────────────────────────────────
+# [MLOps] Executive PDF report — a management-facing summary (model quality,
+# release gates, fairness, calibration, data lineage, drift, pipeline/supply
+# chain, and the ACTUAL security-scan findings) rendered to PDF with reportlab.
+# Runs after security-scan and `needs:` the scanners' JSON/SARIF artifacts so
+# the "Security scan results" section shows real counts; the scan needs are
+# `optional` so a pipeline where a scanner didn't run still gets a report.
+# This is the "hand to stakeholders" artifact; download it from the job.
+report:pdf:
+  stage: report
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]report[:.]pdf(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - when: on_success
+  image: python:3.12-slim
+  needs:
+    - train:model
+    - monitor:evidently
+    - job: scan:secrets-gitleaks
+      optional: true
+    - job: scan:sast-semgrep
+      optional: true
+    - job: scan:sast-bandit
+      optional: true
+    - job: scan:trivy-fs
+      optional: true
+    - job: scan:deps-audit
+      optional: true
+    - job: scan:modelscan
+      optional: true
+    - job: scan:dockerfile-hadolint
+      optional: true
+    - job: scan:sast-ruff-security
+      optional: true
+    - job: scan:sast-njsscan
+      optional: true
+    - job: scan:sast-eslint-security
+      optional: true
+    - job: scan:sast-horusec
+      optional: true
+    - job: scan:secrets-trufflehog
+      optional: true
+    - job: scan:secrets-detect-secrets
+      optional: true
+    - job: scan:deps-osv
+      optional: true
+    - job: scan:deps-grype
+      optional: true
+    - job: scan:deps-retirejs
+      optional: true
+    - job: scan:iac-checkov
+      optional: true
+    - job: scan:iac-kics
+      optional: true
+    - job: scan:licenses
+      optional: true
+    - job: scan:model-fickling
+      optional: true
+    - job: sast
+      optional: true
+    - job: secret_detection
+      optional: true
+    - job: test:load-locust
+      optional: true
+    - job: test:api-fuzz-schemathesis
+      optional: true
+    - job: dast:zap-api
+      optional: true
+    - job: dast:zap-full
+      optional: true
+    - job: dast:nikto
+      optional: true
+    - job: dast:nuclei
+      optional: true
+    - job: ai-security:guardrail-score
+      optional: true
+    - job: scan:no-live-credentials
+      optional: true
+  variables:
+    CAREROUTE_MODEL_DIR: "$CI_PROJECT_DIR/backend/models"
+    CAREROUTE_MONITOR_DIR: "$CI_PROJECT_DIR/backend/monitoring"
+    CAREROUTE_REPORT_DIR: "$CI_PROJECT_DIR/reports"
+  script:
+    - |
+      cd backend
+      pip install -r requirements.txt reportlab==5.0.0 pyyaml
+      python -m app.ml.report
+  artifacts:
+    paths:
+      - reports/careroute_mlops_report.pdf
+      - reports/careroute_mlops_report.md    # readable twin — opens without a PDF viewer
+    when: always
+    expire_in: 1 month
+  allow_failure: true
+
+# [AI-Security] AI for cyber defence (AIC Day 3): an AI-drafted security brief
+# from the scanners' own reports — NIST CSF Detect (DE.AE-02) -> Respond
+# (RS.AN-03). The LLM prioritises and explains; its draft is validated against
+# the real findings and discarded if it cites anything that does not exist or
+# fails the output screen. With no LLM key in CI the DETERMINISTIC severity-ranked
+# brief is produced instead, so the artifact always exists. Secret values from
+# gitleaks are dropped at parse time. Advisory: a person verifies before acting.
+
+ai-security:fairness-gate:
+  stage: ai-security
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]ai\-security[:.]fairness\-gate(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - when: on_success
+  image: python:3.12-slim
+  script:
+    - cd backend
+    - pip install -r requirements.txt -r requirements-dev.txt
+    - pytest tests/test_fairness_gate.py -q --junitxml=fairness-report.xml
+  artifacts:
+    reports:
+      junit: backend/fairness-report.xml
+    when: always
+
+# TRAINING-PHASE + PRIVACY ATTACKS on the classical model (AIC Day 1 taxonomy),
+# plus the deck's model-side DEFENCE. `test:robustness` already covers the
+# deployment-phase third of the attack taxonomy (evasion); this covers the other
+# two — poisoning and privacy — and pins the adversarial-re-training contract
+# (`app/ml/adversarial.py`), whose fast tests need no attack budget.
+#
+# BLOCKING, unlike test:robustness. The poisoning gates need only numpy, so they
+# cannot silently skip: `importorskip("art")` sits inside the one test that
+# needs ART instead of at module level, which is why there is no exit-code-5
+# guard here. A skipped test still reports as a pass; a missing test reports as
+# nothing at all, and this is a safety gate.
+
+# TRAINING-PHASE + PRIVACY ATTACKS on the classical model (AIC Day 1 taxonomy),
+# plus the deck's model-side DEFENCE. `test:robustness` already covers the
+# deployment-phase third of the attack taxonomy (evasion); this covers the other
+# two — poisoning and privacy — and pins the adversarial-re-training contract
+# (`app/ml/adversarial.py`), whose fast tests need no attack budget.
+#
+# BLOCKING, unlike test:robustness. The poisoning gates need only numpy, so they
+# cannot silently skip: `importorskip("art")` sits inside the one test that
+# needs ART instead of at module level, which is why there is no exit-code-5
+# guard here. A skipped test still reports as a pass; a missing test reports as
+# nothing at all, and this is a safety gate.
+ai-security:ml-attacks:
+  stage: ai-security
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]ai\-security[:.]ml\-attacks(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - when: on_success
+  image: python:3.12-slim
+  needs: ["train:model"]
+  variables:
+    CAREROUTE_MODEL_DIR: "$CI_PROJECT_DIR/backend/models"
+  script:
+    - cd backend
+    - pip install -r requirements.txt -r requirements-dev.txt
+    - |
+      pytest tests/test_ml_attacks.py tests/test_adversarial_training.py -q --junitxml=ml-attacks-report.xml
+  artifacts:
+    reports:
+      junit: backend/ml-attacks-report.xml
+    when: always
+
+# Promptfoo (OpenAI, MIT) — LLM red-team regression on every push/PR.
+# Promptfoo red-teams the APP, not a vendor model. Until 2026-09-15 the target
+# was `openai:chat:gpt-4o-mini`, so the attacks never met the guardrail, the
+# redaction or the agents — the job graded OpenAI's safety training and called
+# it ours. The backend is now booted in-job (same recipe as test:e2e) and the
+# config posts every attack to /api/triage/stream. OPENAI_API_KEY is still
+# required, but only for promptfoo's own attack synthesis + grading; the
+# backend runs with no provider and exercises the deterministic path.
+
+# ML-model artifact scan — modelscan (ProtectAI): detects malicious code in
+# serialized models (pickle/torch/keras deserialization attacks).  [AI-Security]
+scan:modelscan:
+  stage: security-scan
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]scan[:.]modelscan(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - when: on_success
+  image: python:3.12-slim
+  needs: ["train:model"]            # scan the REAL trained artifact, present via needs
+  variables:
+    CAREROUTE_MODEL_DIR: "$CI_PROJECT_DIR/backend/models"
+  script:
+    - pip install modelscan
+    # Scope to the model directory (the released joblib + sidecar), NOT the whole
+    # repo: `-p .` tried to parse 18k unrelated files and errored (exit 2) on a
+    # non-model pickle. modelscan exits 0 (clean) / 1 (unsafe operators found);
+    # both are tolerated here (allow_failure) — the verdict is in the report.
+    - modelscan -p backend/models -r json -o modelscan.json || true
+    - modelscan -p backend/models > modelscan.txt 2>&1 || true   # readable copy
+  artifacts:
+    paths: [modelscan.json, modelscan.txt]
+    when: always
+  allow_failure: true
+
+# SBOM + AI-BOM — CycloneDX Software Bill of Materials for the Python + Node
+# dependency graph, plus an AI-BOM that inventories the model artifact + its
+# integrity hashes / metadata. A current SBOM is the supply-chain control that
+# makes a newly-disclosed dependency CVE traceable, and is mapped to OWASP LLM
+# Top-10 LLM03 (Supply-Chain Vulnerabilities) — a poisoned/compromised model or
+# dependency is exactly what an AI-BOM + SBOM make auditable.  [AI-Security][LLM03]
+
+# MODEL ARTIFACT — Fickling (Trail of Bits). scan:modelscan checks the model for
+# known-unsafe operators; Fickling decompiles the PICKLE PROGRAM itself and can
+# report what the payload would execute on load. The joblib is the one artifact
+# this pipeline both produces and later loads in a server process, so it earns
+# two independent checks.
+scan:model-fickling:
+  stage: security-scan
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]scan[:.]model\-fickling(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - when: on_success
+  image: python:3.12-slim
+  needs: ["train:model"]
+  variables:
+    CAREROUTE_MODEL_DIR: "$CI_PROJECT_DIR/backend/models"
+  script:
+    - pip install -q fickling
+    - |
+      found=0
+      : > fickling.txt
+      for f in backend/models/*.joblib backend/models/*.pkl; do
+        [ -e "$f" ] || continue
+        found=1
+        echo "───── $f ─────" | tee -a fickling.txt
+        python -m fickling --check-safety --json-output "$f.fickling.json" "$f" >/dev/null 2>&1 || true
+        python - "$f" <<'PY' | tee -a fickling.txt
+      import ast, sys
+      from fickling.fickle import Pickled
+      # Fickling's own verdict is LIKELY_UNSAFE for ANY non-stdlib import, so it
+      # cannot gate a sklearn model. Gate on an allowlist of what a sklearn
+      # artifact legitimately imports, plus Fickling's unsafe-import list.
+      ALLOWED = ("numpy.", "sklearn.")
+      def names(nodes):
+          out = set()
+          for n in nodes:
+              if isinstance(n, ast.ImportFrom):
+                  out |= {f"{n.module}.{a.name}" for a in n.names}
+              elif isinstance(n, ast.Import):
+                  out |= {a.name for a in n.names}
+          return out
+      with open(sys.argv[1], "rb") as fh:
+          p = Pickled.load(fh)
+      imports, unsafe = names(p.non_standard_imports()), names(p.unsafe_imports())
+      bad = sorted((i for i in imports if not i.startswith(ALLOWED)), key=str) + sorted(unsafe)
+      print(f"{len(p)} opcodes; interpretation error={p.has_interpretation_error}; "
+            f"{len(imports)} non-standard imports; {len(unsafe)} unsafe")
+      for i in sorted(imports | unsafe):
+          print(("  DISALLOWED " if i in bad else "  ok ") + i)
+      sys.exit(1 if bad or p.has_interpretation_error or p.has_invalid_opcode else 0)
+      PY
+      done
+      if [ "$found" -eq 0 ]; then echo "no pickle artifacts found to analyse"; exit 1; fi
+  artifacts:
+    paths: [fickling.txt, backend/models/*.fickling.json]
+    when: always
+  allow_failure: true
+
+# ── BUILD ────────────────────────────────────────────────────────────────────
+# Frontend production bundle. Lives in `build` (a build artifact), NOT in `test`.
+#
+# NO `artifacts:` BLOCK, deliberately. It used to publish `frontend/dist` — a
+# path Next.js has never written: `output: 'standalone'` (next.config.mjs) emits
+# `frontend/.next/standalone` + `.next/static`. GitLab does not fail a job for an
+# artifact path that matches nothing, it just logs a warning, so this "artifact"
+# was empty for as long as it existed. Nothing consumes it either: no job has
+# `needs: ["build:frontend"]`, and build:images runs `docker build frontend`,
+# which recompiles the app inside the image from source. So the fix is to DROP
+# the block rather than repoint it at `.next` — this job's value is as a
+# compile GATE (a broken build fails the pipeline here), not as a producer.
+
+# CONTAINER IMAGE SCAN — Trivy scans the BUILT images (OS packages + Python/Node
+# libraries + secrets + image misconfig) for HIGH/CRITICAL CVEs. Scanning the
+# exported tars means it inspects exactly what build:images produced. This is
+# the container-layer complement to scan:trivy-fs (which scans the source tree).
+# ── PII EGRESS GATE [AI-Security] ────────────────────────────────────────────
+# "PII egress events = 0". app/redact.py masks identifiers at the INPUT
+# boundary; this is the independent check on the other side — did an identifier
+# nevertheless reach an artifact that LEAVES the trust boundary (the inference
+# log, the HITL ground-truth log, the drift report, the executive report, every
+# one of which is published as a CI artifact and downloaded by later jobs)?
+#
+# BLOCKING. For a clinical product this is the one scanner whose findings are
+# never "review at leisure". The findings file carries MASKED excerpts only: a
+# report that quoted the NRIC it caught would have re-published it into exactly
+# the artifact store the gate exists to protect.
+# Runs in the `report` stage, not `security-scan`: it audits artifacts that have
+# already been PUBLISHED, and the executive report is one of them. A gate that
+# ran before the thing it inspects exists would report "skipped" forever.
+scan:pii-egress:
+  stage: report
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]scan[:.]pii\-egress(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - when: on_success
+  image: python:3.12-slim
+  needs: ["monitor:evidently", "report:pdf"]
+  variables:
+    # Same locations report:pdf and monitor:evidently write to. Without these the
+    # gate looks under backend/reports, finds nothing, and reports "skipped"
+    # forever while appearing to run.
+    CAREROUTE_MONITOR_DIR: "$CI_PROJECT_DIR/backend/monitoring"
+    CAREROUTE_REPORT_DIR: "$CI_PROJECT_DIR/reports"
+  script:
+    - cd backend
+    - pip install -r requirements.txt
+    # presidio adds ML-based NER for names/addresses, which no regex catches.
+    # Optional: absent, the gate runs its deterministic rules and says so.
+    - pip install presidio-analyzer || echo "presidio unavailable; deterministic rules only"
+    - python -m app.ml.pii_egress --out "$CI_PROJECT_DIR/pii-egress.json"
+  artifacts:
+    paths: [pii-egress.json]
+    when: always
+
+# ── NOTHING BELOW PRODUCTION SPENDS MONEY [AI-Security] ──────────────────────
+# Asserts that this non-production environment holds no credential an AGENT
+# could use to reach a live, paid or rate-limited service. CareRoute's agents
+# reach OneMap (a shared free account whose password has already leaked into a
+# chat once), the LLM provider, and Onyx.
+#
+# Scope is the whole design: CI PLUMBING credentials (SONAR_TOKEN, the pipeline
+# trigger token, the MLflow token) are deliberately NOT covered — they belong to
+# the pipeline, no agent can reach them, and they must be present for their jobs
+# to work. A gate that fired on those would be wrong every run, and a gate
+# that is wrong every run is one everybody learns to ignore.
+
+# [MLOps] SHADOW DEPLOY (stub). Progressive-delivery strategy for a new model
+# version: rather than a hard cut-over, the CANDIDATE model is loaded ALONGSIDE
+# the live PRIMARY and receives a mirror of production traffic. Its output is
+# only LOGGED/compared (never served to patients), so we measure the candidate's
+# agreement, latency and red-flag recall on REAL traffic before promotion.
+# Promotion strategy once shadow metrics clear:
+#   * BLUE-GREEN — stand up the candidate as a full parallel "green" stack, flip
+#     the router atomically, keep "blue" warm for instant rollback; or
+#   * CANARY — shift 1% -> 5% -> 25% -> 100% of traffic to the candidate, with an
+#     automated rollback if red-flag recall / latency SLOs regress.
+# The joblib from train:model is the candidate; get_model() content-addresses the
+# version, so primary vs candidate are unambiguous and rollback is a version pin.
+deploy:shadow-model:
+  stage: deploy
+  image: python:3.12-slim
+  needs: ["train:model"]
+  variables:
+    CAREROUTE_MODEL_DIR: "$CI_PROJECT_DIR/backend/models"
+  # [MLOps] Pillar 5 — GitLab ENVIRONMENT. Tracks this deploy under a named
+  # "staging" environment (Deploy -> Environments), giving deploy history and a
+  # rollback target. The candidate is shadow-scored in staging before promotion.
+  environment:
+    name: staging
+    deployment_tier: staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]deploy[:.]shadow\-model(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      allow_failure: true
+  script:
+    - cd backend
+    - pip install -r requirements.txt
+    # Load the CANDIDATE alongside the primary and log (not serve) its verdict on
+    # a canned probe — the shadow-scoring hook a real mirror-traffic deploy runs.
+    - >
+      python -c "from app.ml.model import get_model;
+      m=get_model(); a=m.fairness();
+      p=m.predict('crushing chest pain radiating to the arm','40-64','Male');
+      print('CANDIDATE', a.get('modelVersion'), '| shadow-probe acuity=', p['acuity_code'],
+      'conf=', p['confidence'], '| redFlagRecall=', a.get('redFlagRecall'))"
+    - echo "Shadow scoring only — candidate NOT promoted. Compare vs primary, then blue-green/canary."
+
+# [MLOps] Pillar 5 — PROMOTE TO PRODUCTION. Manual gate that promotes the shadow-
+# validated candidate — but only after the CHAMPION-CHALLENGER GATE: the
+# candidate's audited metrics (model_audit.json from train:model) must be at
+# least as good as the current Production (champion) model's registry metrics,
+# within a small tolerance. A candidate that regresses accuracy or the
+# safety-critical red-flag recall FAILS the job — promotion is a decision made
+# on evidence, not "latest wins". Then transitions the MLflow-registered
+# `CareRouteTriageRF` to the "Production" stage (the Dev->Staging->Production
+# model lifecycle the course teaches) and stands it up as the production
+# environment. It records the champion's version (PREVIOUS_MODEL_VERSION,
+# dotenv) so rollback:production can re-pin it if this release is reverted.
+# The container rollout itself is deploy:push-images -> deploy:ecs.
+# NOTE: MLflow >= 2.9 deprecates registry STAGES in favour of version ALIASES
+# (`@production` via set_registered_model_alias). The stage lifecycle is kept
+# here because it is the model the course teaches and GitLab's registry
+# supports it; the alias call is the drop-in successor.
+
+# [MLOps] Pillar 5 — PROMOTE TO PRODUCTION. Manual gate that promotes the shadow-
+# validated candidate — but only after the CHAMPION-CHALLENGER GATE: the
+# candidate's audited metrics (model_audit.json from train:model) must be at
+# least as good as the current Production (champion) model's registry metrics,
+# within a small tolerance. A candidate that regresses accuracy or the
+# safety-critical red-flag recall FAILS the job — promotion is a decision made
+# on evidence, not "latest wins". Then transitions the MLflow-registered
+# `CareRouteTriageRF` to the "Production" stage (the Dev->Staging->Production
+# model lifecycle the course teaches) and stands it up as the production
+# environment. It records the champion's version (PREVIOUS_MODEL_VERSION,
+# dotenv) so rollback:production can re-pin it if this release is reverted.
+# The container rollout itself is deploy:push-images -> deploy:ecs.
+# NOTE: MLflow >= 2.9 deprecates registry STAGES in favour of version ALIASES
+# (`@production` via set_registered_model_alias). The stage lifecycle is kept
+# here because it is the model the course teaches and GitLab's registry
+# supports it; the alias call is the drop-in successor.
+deploy:promote-production:
+  stage: deploy
+  image: python:3.12-slim
+  needs: ["deploy:shadow-model", "train:model"]
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]deploy[:.]promote\-production(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true   # OPTIONAL manual gate — pipeline stays green; a human
+                            # explicitly promotes to production, never auto-run.
+  environment:
+    name: production
+    deployment_tier: production
+  artifacts:
+    paths: [backend/mlflow.db, backend/mlruns/]
+    reports:
+      dotenv: deploy.env
+  script:
+    - pip install -q -r backend/requirements.txt mlflow==3.16.1
+    - touch deploy.env
+    # CHAMPION = the model actually serving (live /api/fairness), because a
+    # registry that lives in one pipeline's artifact never holds a previous
+    # champion. The old step looked for MLFLOW_TRACKING_URI (never set in CI) and
+    # the Stages API (removed in MLflow 3), so it always printed "skipped".
+    - |
+      python - <<'PY'
+      import json, os, sys, urllib.request
+      TOLERANCE = 0.005
+      cand = json.load(open("backend/models/model_audit.json"))
+      url = os.environ.get("CAREROUTE_APP_URL", "http://careroute-demo-alb-1032403210.ap-southeast-1.elb.amazonaws.com")
+      try:
+          with urllib.request.urlopen(f"{url}/api/fairness", timeout=20) as r:  # nosec B310  # fixed https/http app URL
+              champ = json.load(r)
+      except Exception as exc:
+          print(f"champion unavailable ({exc}); release gates already enforced upstream")
+          champ = {}
+      print(f"candidate {cand.get('modelVersion')}: acc={cand['overallAccuracy']} recall={cand['redFlagRecall']}")
+      print(f"champion  {champ.get('modelVersion')}: acc={champ.get('overallAccuracy')} recall={champ.get('redFlagRecall')}")
+      with open("deploy.env", "a") as fh:
+          print(f"PREVIOUS_MODEL_VERSION={champ.get('modelVersion', '')}", file=fh)
+      for k in ("overallAccuracy", "redFlagRecall"):
+          if isinstance(champ.get(k), (int, float)) and cand[k] < champ[k] - TOLERANCE:
+              sys.exit(f"CHAMPION-CHALLENGER GATE FAILED: {k} {champ[k]} -> {cand[k]}")
+      print("champion-challenger gate: PASSED")
+      PY
+    - cd backend && python -m app.ml.promote --show && python -m app.ml.promote && python -m app.ml.promote --show
+    - echo "Model promoted. Ship the containers with deploy:push-images -> deploy:ecs."
+
+# [MLOps] Pillar 5 — ROLLBACK. Most rollbacks need no job at all: while a
+# rollout or its bake period is open, ECS reverts on its own (circuit breaker,
+# or the infra repo's 5xx-rate alarm at canary.py's 1% — see careroute_ai_infra
+# modules/careroute_stack/deploy_safety.tf). This job is for a release that got
+# past that window and was found bad LATER.
+#
+# Two halves, one click:
+#   1. CONTAINERS — scripts/deploy_ecs.sh rollback: rolls the services back
+#      onto the PREVIOUS verified image tag (the release history deploy:ecs
+#      keeps in SSM), checks the image still exists in ECR first, and waits
+#      until ECS is serving it — the same path as deploy:ecs, so this job goes
+#      red if the rollback itself does not hold. Set ROLLBACK_IMAGE_TAG when
+#      running this job to pick a specific older tag.
+#   2. MODEL REGISTRY — re-pin the version that was Production before this
+#      pipeline's promotion (PREVIOUS_MODEL_VERSION from deploy:promote-production),
+#      so the next champion-challenger gate compares against what is serving.
+#
+# Replaces `deploy:canary-production`, whose Prometheus-driven ramp could never
+# run — GitLab's shared runners cannot reach an in-VPC Prometheus — and whose
+# error-rate rule ECS now enforces from CloudWatch instead.
+
+# [MLOps] Pillar 5 — ROLLBACK. Most rollbacks need no job at all: while a
+# rollout or its bake period is open, ECS reverts on its own (circuit breaker,
+# or the infra repo's 5xx-rate alarm at canary.py's 1% — see careroute_ai_infra
+# modules/careroute_stack/deploy_safety.tf). This job is for a release that got
+# past that window and was found bad LATER.
+#
+# Two halves, one click:
+#   1. CONTAINERS — scripts/deploy_ecs.sh rollback: rolls the services back
+#      onto the PREVIOUS verified image tag (the release history deploy:ecs
+#      keeps in SSM), checks the image still exists in ECR first, and waits
+#      until ECS is serving it — the same path as deploy:ecs, so this job goes
+#      red if the rollback itself does not hold. Set ROLLBACK_IMAGE_TAG when
+#      running this job to pick a specific older tag.
+#   2. MODEL REGISTRY — re-pin the version that was Production before this
+#      pipeline's promotion (PREVIOUS_MODEL_VERSION from deploy:promote-production),
+#      so the next champion-challenger gate compares against what is serving.
+#
+# Replaces `deploy:canary-production`, whose Prometheus-driven ramp could never
+# run — GitLab's shared runners cannot reach an in-VPC Prometheus — and whose
+# error-rate rule ECS now enforces from CloudWatch instead.
+rollback:production:
+  stage: deploy
+  image: python:3.12-slim
+  needs: ["deploy:promote-production"]
+  resource_group: ecs-deploy # never at the same time as a deploy:ecs rollout
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: https://gitlab.com
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^only\// && $CI_COMMIT_BRANCH !~ /[\/,]rollback[:.]production(,|$)/'  # only/<jobs> branch lists other jobs
+      when: never
+    - if: '$CAREROUTE_PYRIT_ONLY == "true"'  # security/pyrit: only the PyRIT job runs
+      when: never
+    - if: '$CAREROUTE_DEPLOY_ONLY == "true"'  # release/deploy: deploy path only
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "release/deploy"'
+      when: manual
+      allow_failure: true
+  environment:
+    name: production
+    deployment_tier: production
+  script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends jq >/dev/null
+    - pip install -q awscli
+    - |
+      if [ -n "${AWS_DEPLOY_ROLE_ARN:-}" ]; then
+        printf '%s' "$AWS_ID_TOKEN" > /tmp/aws-web-identity-token
+        export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/aws-web-identity-token
+        export AWS_ROLE_ARN="$AWS_DEPLOY_ROLE_ARN" AWS_ROLE_SESSION_NAME="gitlab-rollback-${CI_JOB_ID}"
+      fi
+    - sh scripts/deploy_ecs.sh rollback "${ROLLBACK_IMAGE_TAG:-}"
+    - pip install -q mlflow==3.16.1
+    - |
+      python - <<'PY'
+      import os
+      v = os.environ.get("PREVIOUS_MODEL_VERSION")
+      if not (v and os.environ.get("MLFLOW_TRACKING_URI")):
+          print("registry re-pin skipped: no previous Production version recorded, or MLflow unset")
+      else:
+          import mlflow
+          c = mlflow.tracking.MlflowClient()
+          c.transition_model_version_stage("CareRouteTriageRF", v, "Production",
+                                           archive_existing_versions=True)
+          print(f"re-pinned CareRouteTriageRF v{v} -> Production")
+      PY
+
+# ── POST-DEPLOY ──────────────────────────────────────────────────────────────
+# DAST — OWASP ZAP baseline against the RUNNING deployed/staging app. Moved OUT of
+# `security-scan` (which runs before anything is deployed) into `post-deploy`, so
+# it targets a LIVE instance — DAST scans a running app, not source. Point
+# DAST_TARGET at the staging URL stood up by the deploy stage.
